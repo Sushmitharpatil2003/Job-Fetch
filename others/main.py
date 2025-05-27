@@ -18,6 +18,28 @@ import time
 cohere_api_key = os.getenv("COHERE_API_KEY")
 serpapi_key = os.getenv("SERPAPI_KEY")
 
+def parse_event_date(date_str):
+    date_str = date_str.strip()
+    if not date_str:
+        return "", ""
+
+    # Normalize common range delimiters
+    date_str = re.sub(r"\s?(to|–|\-|until)\s?", " to ", date_str)
+    
+    try:
+        # Match date ranges like '12 May 2024 to 15 May 2024'
+        range_match = re.search(r"(\d{1,2} \w+ \d{4}) to (\d{1,2} \w+ \d{4})", date_str)
+        if range_match:
+            start = datetime.strptime(range_match.group(1), "%d %B %Y").strftime("%Y-%m-%d")
+            end = datetime.strptime(range_match.group(2), "%d %B %Y").strftime("%Y-%m-%d")
+            return start, end
+        else:
+            # Fallback single date
+            date = datetime.strptime(date_str, "%d %B %Y").strftime("%Y-%m-%d")
+            return date, date
+    except:
+        return date_str, date_str
+
 class EventJobScraper:
     def __init__(self):
         self.co = None
@@ -95,13 +117,7 @@ class EventJobScraper:
         try:
             driver.get(url)
             time.sleep(2)
-            page_text = driver.find_element(By.TAG_NAME, 'body').text[:3000].lower()
-
-            # Basic keyword check before proceeding
-            keywords = ['job', 'walk-in', 'drive', 'event', 'fair', 'recruitment', 'career', 'hiring']
-            if not any(k in page_text for k in keywords):
-                st.info(f"Skipping {url}: no event-related keywords found.")
-                return None
+            page_text = driver.find_element(By.TAG_NAME, 'body').text[:3000]
 
             prompt = f"""Extract job event details in JSON format from the following text:
 
@@ -116,8 +132,6 @@ class EventJobScraper:
             - description (string)
             - contact_email (string)
             - is_virtual (boolean)
-
-            If no relevant event info is found, respond with an empty JSON object: {{}}
             """
 
             response = self.co.generate(
@@ -126,24 +140,15 @@ class EventJobScraper:
                 max_tokens=400,
                 temperature=0.2
             )
-            raw_output = response.generations[0].text.strip()
-
-            # Try to parse JSON; if fails, log and skip
-            try:
-                data = json.loads(raw_output)
-                if not data or data == {}:
-                    st.info(f"No event data extracted from {url}")
-                    return None
-                data['source_url'] = url
-                return [data]
-            except json.JSONDecodeError:
-                st.warning(f"Failed parsing JSON from Cohere for {url}")
-                return None
-
+            data = json.loads(response.generations[0].text.strip())
+            data['source_url'] = url
+            start, end = parse_event_date(data.get('event_date', ''))
+            data['start_date'] = start
+            data['end_date'] = end
+            return data
         except Exception as e:
             st.warning(f"Failed extracting from {url}: {str(e)}")
             return None
-
 
     def save_event_data(self, events, format='excel'):
         if not events:
@@ -153,7 +158,8 @@ class EventJobScraper:
             output = BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False)
-            return output.getvalue()
+            output.seek(0)
+            return output
         return df.to_json(orient='records', indent=2)
 
 def main():
@@ -194,7 +200,7 @@ def main():
             for url in unique_urls:
                 result = scraper.extract_event_details(url, driver)
                 if result:
-                    events.extend(result)  # flatten list of event dicts here
+                    events.append(result)
             driver.quit()
             status.update(label="Extraction complete", state="complete")
 
@@ -204,17 +210,13 @@ def main():
 
         st.success(f"Found {len(events)} job events!")
 
-        df = pd.DataFrame(events)
-        cols = ['event_name', 'event_date', 'event_location', 'organizer']
-        available_cols = [c for c in cols if c in df.columns]
-
         tab1, tab2 = st.tabs(["Summary Table", "Detailed View"])
         with tab1:
-            st.dataframe(df[available_cols], use_container_width=True)
+            st.dataframe(pd.DataFrame(events)[['event_name', 'start_date', 'end_date', 'event_location', 'organizer']], use_container_width=True)
         with tab2:
             for e in events:
                 with st.expander(e.get("event_name", "Unnamed Event")):
-                    st.markdown(f"**Date:** {e.get('event_date', 'N/A')}")
+                    st.markdown(f"**Date:** {e.get('start_date', 'N/A')} to {e.get('end_date', 'N/A')}")
                     st.markdown(f"**Location:** {e.get('event_location', 'N/A')}")
                     st.markdown(f"**Organizer:** {e.get('organizer', 'N/A')}")
                     st.markdown(f"**Virtual:** {'Yes' if e.get('is_virtual') else 'No'}")
@@ -223,8 +225,11 @@ def main():
                         st.markdown(f"[Register Here]({e['registration_url']})")
                     st.markdown(f"[Source]({e['source_url']})")
 
-        st.download_button("📥 Download as Excel", data=scraper.save_event_data(events, 'excel'), file_name="job_events.xlsx")
-        st.download_button("📥 Download as JSON", data=scraper.save_event_data(events, 'json'), file_name="job_events.json")
+        excel_file = scraper.save_event_data(events, 'excel')
+        json_file = scraper.save_event_data(events, 'json')
+
+        st.download_button("📥 Download as Excel", data=excel_file, file_name="job_events.xlsx")
+        st.download_button("📥 Download as JSON", data=json_file, file_name="job_events.json")
 
 if __name__ == "__main__":
     main()
